@@ -1,325 +1,305 @@
 const express = require('express');
 const cors = require('cors');
-const dns = require("dns");
-const dotenv = require("dotenv");
+const dns = require('dns');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const compression = require('compression');
+require('dotenv').config();
 
-// DNS 
-dns.setServers(["8.8.8.8", "1.1.1.1"]);
-dotenv.config();
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
+const { initializeApp, cert } = require('firebase-admin/app');
+const { getAuth } = require('firebase-admin/auth');
+
+// DNS resolver for reliable SRV lookups in some environments
+dns.setServers(['8.8.8.8', '1.1.1.1']);
 
 const app = express();
-const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-const { initializeApp, cert } = require("firebase-admin/app");
-const { getAuth } = require("firebase-admin/auth");
-
-const serviceAccount = require("./serviceAccountKey.json");
-
-initializeApp({
-  credential: cert(serviceAccount)
-});
-
-app.use(cors());
-app.use(express.json());
-
 const port = process.env.PORT || 3000;
 
+// 1. Security Headers & Compression
+app.disable('x-powered-by');
+app.use(helmet());
+app.use(compression());
+
+// 2. Rate Limiting (DoS / Brute-force সুরক্ষা)
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 150, // প্রতি IP থেকে 15 মিনিটে সর্বোচ্চ 150 রিকোয়েস্ট
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many requests, please try again later.' },
+});
+app.use('/models', apiLimiter);
+
+// 3. CORS Configuration (শুধুমাত্র অনুমোদিত ফ্রন্টএন্ড ডোমেইন)
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'https://modelhub-96e69.web.app',
+  process.env.CLIENT_URL,
+].filter(Boolean);
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      // Server-to-server বা curl/Postman (no origin) চাইলে allow করা যায়, নতুবা strict চেক
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error('Not allowed by CORS'));
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
+
+// Body size limit (বড় payload দিয়ে সার্ভার ক্র্যাশ/DoS ঠেকাতে)
+app.use(express.json({ limit: '100kb' }));
+
+// 4. Firebase Admin Initialization
+let serviceAccount;
+try {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
+    const decoded = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, 'base64').toString('utf8');
+    serviceAccount = JSON.parse(decoded);
+  } else {
+    serviceAccount = require('./serviceAccountKey.json');
+  }
+} catch (err) {
+  console.error('Failed to load Firebase service account:', err.message);
+  process.exit(1);
+}
+
+initializeApp({
+  credential: cert(serviceAccount),
+});
+
+const auth = getAuth();
+
+// 5. MongoDB Client (একবার তৈরি করে রিকোয়েস্টগুলোতে পুনর্ব্যবহার করা)
 const uri = process.env.MONGODB_URI;
+if (!uri) {
+  console.error('Missing MONGODB_URI in environment variables');
+  process.exit(1);
+}
 
 const client = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
     strict: true,
     deprecationErrors: true,
+  },
+  maxPoolSize: 20, // কানেকশন পুল অপ্টিমাইজেশন
+  minPoolSize: 2,
+});
+
+let dbPromise = null;
+
+async function getCollections() {
+  if (!dbPromise) {
+    dbPromise = client
+      .connect()
+      .then(async () => {
+        const db = client.db('modelDB');
+        const modelsCollection = db.collection('models');
+        const downloadsCollection = db.collection('downloads');
+        const cartCollection = db.collection('carts');
+
+        // সার্চ বা সর্টিং দ্রুত করতে ইনডেক্স (ব্যর্থ হলে সার্ভার থামাবে না)
+        await modelsCollection.createIndex({ createdAt: -1 }).catch(() => {});
+        return { modelsCollection, downloadsCollection, cartCollection };
+      })
+      .catch((err) => {
+        dbPromise = null;
+        throw err;
+      });
+  }
+  return dbPromise;
+}
+
+// Helper: ইনপুট স্যানিটাইজেশন ও টাইপ চেক (NoSQL Injection & XSS প্রতিরোধ)
+function sanitizeString(value, maxLen = 500) {
+  if (typeof value !== 'string') return '';
+  return value
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+    .replace(/[<>]/g, '')
+    .trim()
+    .slice(0, maxLen);
+}
+
+function buildModelPayload(body = {}) {
+  const payload = {};
+
+  if (body.name !== undefined) payload.name = sanitizeString(body.name, 120);
+  if (body.title !== undefined) payload.title = sanitizeString(body.title, 150);
+  if (body.category !== undefined) payload.category = sanitizeString(body.category, 80);
+  if (body.description !== undefined) payload.description = sanitizeString(body.description, 2000);
+  if (body.image !== undefined) {
+    const cleanUrl = sanitizeString(body.image, 500);
+    if (cleanUrl && /^https?:\/\//i.test(cleanUrl)) {
+      payload.image = cleanUrl;
+    }
+  }
+  if (body.price !== undefined && typeof body.price === 'number' && Number.isFinite(body.price) && body.price >= 0) {
+    payload.price = body.price;
+  }
+
+  return payload;
+}
+
+function resolveIdQuery(id) {
+  if (ObjectId.isValid(id) && String(new ObjectId(id)) === id) {
+    return { _id: new ObjectId(id) };
+  }
+  return { _id: id };
+}
+
+// 6. Verify Token Middleware
+const verifyToken = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).send({ message: 'unauthorized access' });
+    }
+
+    const token = authHeader.split(' ')[1];
+    if (!token) {
+      return res.status(401).send({ message: 'unauthorized access' });
+    }
+
+    const decodedToken = await auth.verifyIdToken(token);
+    req.decodedToken = decodedToken;
+    next();
+  } catch (error) {
+    console.error('Token verification error:', error.message);
+    return res.status(401).send({ message: 'unauthorized access' });
+  }
+};
+
+// 7. Root Route
+app.get('/', (req, res) => {
+  res.status(200).send('new server is running');
+});
+
+// 8. Models Routes
+// GET all models (pagination + lean projection দিয়ে দ্রুত রেসপন্স)
+app.get('/models', async (req, res) => {
+  try {
+    const { modelsCollection } = await getCollections();
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
+    const skip = Math.max(parseInt(req.query.skip, 10) || 0, 0);
+
+    const models = await modelsCollection
+      .find({}, { projection: { description: 0 } })
+      .skip(skip)
+      .limit(limit)
+      .toArray();
+
+    res.status(200).send(models);
+  } catch (error) {
+    console.error('Error fetching models:', error);
+    res.status(500).send({ success: false, message: 'Failed to fetch models' });
   }
 });
 
-async function run() {
+// POST new model (protected + sanitized)
+app.post('/models', verifyToken, async (req, res) => {
   try {
-    // Connect the client to the server
-    await client.connect();
+    const { modelsCollection } = await getCollections();
+    const cleanData = buildModelPayload(req.body);
 
-    const db = client.db('modelDB');
-    const modelCollection = db.collection('models');
-    const downloadsCollection = db.collection('downloads');
-    const cartCollection = db.collection('carts');
+    if (!cleanData.name && !cleanData.title) {
+      return res.status(400).send({ success: false, message: 'Model name or title is required' });
+    }
 
-    // Root route
-    app.get('/', (req, res) => {
-        res.send('new server is running');
-    });
-
-    // Verify Token Middleware
-    const verifyToken = async (req, res, next) => {
-      try {
-        const authorization = req.headers.authorization;
-
-        if (!authorization) {
-          return res.status(401).send({
-            message: "unauthorized access"
-          });
-        }
-
-        const token = authorization.split(" ")[1];
-        const decodedToken = await getAuth().verifyIdToken(token);
-        req.decodedToken = decodedToken;
-        next();
-      } catch (error) {
-        console.error("Token verification error:", error);
-        return res.status(401).send({
-          message: "unauthorized access"
-        });
-      }
+    const docToInsert = {
+      ...cleanData,
+      createdBy: req.decodedToken.email || req.decodedToken.uid,
+      createdAt: new Date(),
     };
 
-    // Get all models
-    app.get('/models', async (req, res) => {
-        try {
-            const result = await modelCollection.find().toArray();
-            res.send(result);
-        } catch (error) {
-            console.error("Error fetching models:", error);
-            res.status(500).send({ success: false, message: "Failed to fetch models" });
-        }
-    });
-
-    // Send data (Post model)
-    app.post('/models', async (req, res) => {
-      try {
-        const data = req.body;
-        const result = await modelCollection.insertOne(data);
-        res.send({ success: true, result });
-      } catch (error) {
-        console.error("Error posting model:", error);
-        res.status(500).send({ success: false, error: error.message });
-      }
-    });
-
-    // Get data by id
-    app.get('/models/:id', async (req, res) => {
-      try {
-        const { id } = req.params;
-        let query;
-
-        if (ObjectId.isValid(id)) {
-          query = { _id: new ObjectId(id) };
-        } else {
-          query = { _id: id };
-        }
-
-        const result = await modelCollection.findOne(query);
-        
-        if (!result) {
-          return res.status(404).send({ success: false, message: "Model not found" });
-        }
-
-        res.send({ success: true, result });
-      } catch (error) {
-        console.error("Error fetching model by id:", error);
-        res.status(500).send({ success: false, error: error.message });
-      }
-    });
-
-    // UPDATE DATA
-    app.put('/models/:id', verifyToken, async (req, res) => {
-      try {
-        const { id } = req.params;
-        if (!ObjectId.isValid(id)) {
-          return res.status(400).send({ success: false, message: "Invalid ID format" });
-        }
-
-        const model = await modelCollection.findOne({ _id: new ObjectId(id) });
-        if (!model) {
-          return res.status(404).send({ success: false, message: "Model not found" });
-        }
-
-        const data = req.body;
-        const filter = { _id: new ObjectId(id) };
-        const update = {
-          $set: data
-        };
-        const result = await modelCollection.updateOne(filter, update);
-        
-        res.send({
-          success: true,
-          result
-        });
-      } catch (error) {
-        console.error("Error updating model:", error);
-        res.status(500).send({ success: false, error: error.message });
-      }
-    });
-
-    // DELETE DATA
-    app.delete('/models/:id', verifyToken, async (req, res) => {
-      try {
-        const { id } = req.params;
-        if (!ObjectId.isValid(id)) {
-          return res.status(400).send({ success: false, message: "Invalid ID format" });
-        }
-
-        const model = await modelCollection.findOne({ _id: new ObjectId(id) });
-        if (!model) {
-          return res.status(404).send({ success: false, message: "Model not found" });
-        }
-
-        const filter = { _id: new ObjectId(id) };
-        const result = await modelCollection.deleteOne(filter);
-        
-        res.send({
-          success: true,
-          result
-        });
-      } catch (error) {
-        console.error("Error deleting model:", error);
-        res.status(500).send({ success: false, error: error.message });
-      }
-    });
-
-    // Recent data
-    app.get('/latest-models', async (req, res) => {
-      try {
-        const result = await modelCollection.find().sort({ createdAt: -1 }).limit(6).toArray();
-        res.send(result);
-      } catch (error) {
-        console.error("Error fetching latest models:", error);
-        res.status(500).send({ message: "Failed to fetch latest models" });
-      }
-    });
-
-    app.get('/my-models', verifyToken, async (req, res) => {
-      try {
-        const email = req.query.email;
-        const query = { created_by: email };
-        const result = await modelCollection.find(query).toArray();
-        res.send(result);
-      } catch (error) {
-        console.error("Error fetching user models:", error);
-        res.status(500).send({ message: "Failed to fetch user models" });
-      }
-    });
-
-    // Download API
-    app.post('/downloads/:id', async (req, res) => {
-        try {
-            const modelId = req.params.id; 
-            if (!ObjectId.isValid(modelId)) {
-              return res.status(400).send({ message: "Invalid Model ID format" });
-            }
-            const data = req.body;
-            
-            const result = await downloadsCollection.insertOne({
-                ...data,
-                model_id: modelId
-            });
-
-            const filter = { _id: new ObjectId(modelId) };
-            const update = {
-                $inc: {
-                    downloads: 1
-                }
-            };
-            
-            const downloadCounted = await modelCollection.updateOne(filter, update);
-
-            res.send({ result, downloadCounted });
-            
-        } catch (error) {
-            console.error("Error updating download count:", error);
-            res.status(500).send({ message: "Failed to update download count" });
-        }
-    });
-
-    // My downloads API
-    app.get('/my-downloads', async (req, res) => {
-        try {
-            const email = req.query.email;
-            const query = { downloaded_by: email };
-            const result = await downloadsCollection.find(query).toArray();
-            res.send(result);
-        } catch (error) {
-            console.error("Error fetching downloads:", error);
-            res.status(500).send({ message: "Failed to fetch downloads" });
-        }
-    });
-
-    // Get cart items by user email
-    app.get('/cart', verifyToken, async (req, res) => {
-        try {
-            const email = req.query.email;
-            const query = { user_email: email };
-            const result = await cartCollection.find(query).toArray();
-            res.send(result);
-        } catch (error) {
-            console.error("Error fetching cart items:", error);
-            res.status(500).send({ message: "Failed to fetch cart items" });
-        }
-    });
-
-    // Add to Cart API
-    app.post('/cart', verifyToken, async (req, res) => {
-        try {
-            const cartItem = req.body;
-            
-            const query = { 
-                model_id: cartItem.model_id, 
-                user_email: cartItem.user_email 
-            };
-            const existingItem = await cartCollection.findOne(query);
-
-            if (existingItem) {
-                return res.status(400).send({ message: "Product already in cart!" });
-            }
-
-            const result = await cartCollection.insertOne(cartItem);
-            res.send(result);
-        } catch (error) {
-            console.error("Error adding to cart:", error);
-            res.status(500).send({ message: "Failed to add to cart" });
-        }
-    });
-
-    // Delete cart item by id
-    app.delete('/cart/:id', async (req, res) => {
-        try {
-            const id = req.params.id;
-            if (!ObjectId.isValid(id)) {
-              return res.status(400).send({ message: "Invalid ID format" });
-            }
-            const query = { _id: new ObjectId(id) };
-            const result = await cartCollection.deleteOne(query);
-            res.send(result);
-        } catch (error) {
-            console.error("Error deleting cart item:", error);
-            res.status(500).send({ message: "Failed to delete item" });
-        }
-    });
-
-    // Search API
-    app.get('/search', async (req, res) => {
-      try {
-        const search_text = req.query.search;
-        const result = await modelCollection.find({ modelName: { $regex: search_text,$options: "i" } }).toArray();
-        res.send(result);
-      } catch (error) {
-        console.error("Error searching models:", error);
-        res.status(500).send({ message: "Failed to search models" });
-      }
-    });
-
-    app.get('/hello', (req, res) => {
-        res.send('got a get request');
-    });
-
-    // Send a ping to confirm a successful connection
-    await client.db("admin").command({ ping: 1 });
-    console.log("Pinged your deployment. You successfully connected to MongoDB!");
-
-  } catch (err) {
-    console.error("Database connection error:", err);
+    const result = await modelsCollection.insertOne(docToInsert);
+    res.status(201).send({ success: true, insertedId: result.insertedId });
+  } catch (error) {
+    console.error('Error posting model:', error);
+    res.status(500).send({ success: false, message: 'Failed to post model' });
   }
-}
-run().catch(console.dir);
+});
+
+// GET single model by id
+app.get('/models/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { modelsCollection } = await getCollections();
+    const query = resolveIdQuery(id);
+
+    const model = await modelsCollection.findOne(query);
+    if (!model) {
+      return res.status(404).send({ success: false, message: 'Model not found' });
+    }
+
+    res.status(200).send(model);
+  } catch (error) {
+    console.error('Error fetching model by id:', error);
+    res.status(500).send({ success: false, message: 'Failed to fetch model' });
+  }
+});
+
+// UPDATE model by id (protected + sanitized)
+app.put('/models/:id', verifyToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { modelsCollection } = await getCollections();
+    const query = resolveIdQuery(id);
+    const updates = buildModelPayload(req.body);
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).send({ success: false, message: 'No valid fields to update' });
+    }
+
+    updates.updatedAt = new Date();
+
+    const result = await modelsCollection.updateOne(query, { $set: updates });
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ success: false, message: 'Model not found' });
+    }
+
+    res.status(200).send({ success: true, modifiedCount: result.modifiedCount });
+  } catch (error) {
+    console.error('Error updating model:', error);
+    res.status(500).send({ success: false, message: 'Failed to update model' });
+  }
+});
+
+// DELETE model by id (protected)
+app.delete('/models/:id', verifyToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { modelsCollection } = await getCollections();
+    const query = resolveIdQuery(id);
+
+    const result = await modelsCollection.deleteOne(query);
+    if (result.deletedCount === 0) {
+      return res.status(404).send({ success: false, message: 'Model not found' });
+    }
+
+    res.status(200).send({ success: true, deletedCount: result.deletedCount });
+  } catch (error) {
+    console.error('Error deleting model:', error);
+    res.status(500).send({ success: false, message: 'Failed to delete model' });
+  }
+});
+
+// Global error handler
+app.use((err, req, res, next) => {
+  if (err && err.message === 'Not allowed by CORS') {
+    return res.status(403).send({ success: false, message: 'CORS policy blocked this request' });
+  }
+  console.error('Unhandled error:', err);
+  res.status(500).send({ success: false, message: 'Internal server error' });
+});
 
 app.listen(port, () => {
-    console.log(`new server running on port no ${port}`);
+  console.log(`Server is running on port ${port}`);
 });
