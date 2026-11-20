@@ -15,14 +15,14 @@ This is the backend server repository for Model Hub, handling database operation
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
+git clone https://github.com/hanjala2P/modelHubServerSide.git
 
 ```
 
 
 2. Navigate to the project directory:
 ```bash
-cd newserver
+cd modelHubServerSide
 
 ```
 
@@ -45,6 +45,6 @@ CLIENT_URL=your_frontend_url
 
 5. Start the server:
 ```bash
-npm start
+npm run dev
 
 ```
