@@ -4,18 +4,13 @@
   "description": "",
   "license": "ISC",
   "author": "",
-<<<<<<< HEAD
   "type": "module",
-=======
-  "type": "commonjs",
->>>>>>> f9e523bb0cfb65bd6f6a579c3bed58915b643181
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js"
   },
   "dependencies": {
-<<<<<<< HEAD
     "compression": "^1.8.2",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
@@ -23,12 +18,6 @@
     "express-rate-limit": "^8.7.5",
     "firebase-admin": "^14.4.0",
     "helmet": "^8.3.0",
-=======
-    "cors": "^2.8.6",
-    "dotenv": "^17.4.2",
-    "express": "^5.2.1",
-    "firebase-admin": "^14.4.0",
->>>>>>> f9e523bb0cfb65bd6f6a579c3bed58915b643181
     "jose": "^6.2.12",
     "jwks-rsa": "^4.1.0",
     "mongodb": "^7.5.0",
