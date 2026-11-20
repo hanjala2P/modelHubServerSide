@@ -1,32 +1,50 @@
-<<<<<<< HEAD
-# modelHubServerSide
-# modelHubServerSide
-# modelHubServerSide
-# modelHubServerSide
-=======
-# 3D Model Hub - Backend Server
 
-Welcome to the backend server repository for **3D Model Hub**. This Node.js & Express server handles database operations, authentication verification via Firebase Admin, and CRUD functionality for 3D assets.
+# Model Hub - Backend Server
 
----
+This is the backend server repository for Model Hub, handling database operations, authentication verification via Firebase Admin, and CRUD functionality.
 
-## 🚀 Tech Stack
+## Tech Stack
 
-- **Node.js**
-- **Express.js**
-- **MongoDB & Mongoose** (Database)
-- **Firebase Admin SDK** (Authentication & Token Verification)
-- **CORS & Dotenv**
+* Node.js
+* Express.js
+* MongoDB & Mongoose
+* Firebase Admin SDK
+* CORS & Dotenv
 
----
+## Installation & Setup
 
-## 📁 Project Structure
+1. Clone the repository:
+```bash
+git clone <repository-url>
 
-```text
-modelHubServerSide/
-├── index.js          # Main entry point & API routes
-├── package.json      # Dependencies and scripts
-├── package-lock.json # Dependency lock file
-├── vercel.json       # Vercel deployment configuration
-└── README.md         # Project documentation
->>>>>>> f9e523bb0cfb65bd6f6a579c3bed58915b643181
+```
+
+
+2. Navigate to the project directory:
+```bash
+cd newserver
+
+```
+
+
+3. Install dependencies:
+```bash
+npm install
+
+```
+
+
+4. Create a `.env` file in the root directory and add your environment variables:
+```env
+PORT=5000
+MONGODB_URI=your_mongodb_connection_string
+CLIENT_URL=your_frontend_url
+
+```
+
+
+5. Start the server:
+```bash
+npm start
+
+```
