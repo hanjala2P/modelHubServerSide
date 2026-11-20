@@ -1,8 +1,9 @@
 {
   "name": "newserver",
   "version": "1.0.0",
+  "description": "",
   "license": "ISC",
-  "type": "module",
+  "author": "",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
