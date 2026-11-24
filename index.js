@@ -21,17 +21,17 @@ app.disable('x-powered-by');
 app.use(helmet());
 app.use(compression());
 
-// 2. Rate Limiting (DoS / Brute-force সুরক্ষা)
+// 2. Rate Limiting (DoS / Brute-force protection)
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 150, // প্রতি IP থেকে 15 মিনিটে সর্বোচ্চ 150 রিকোয়েস্ট
+  max: 150, // Max 150 requests per IP per 15 minutes
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Too many requests, please try again later.' },
 });
 app.use('/models', apiLimiter);
 
-// 3. CORS Configuration (শুধুমাত্র অনুমোদিত ফ্রন্টএন্ড ডোমেইন)
+// 3. CORS Configuration (Allowed frontend origins only)
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:3000',
@@ -42,7 +42,7 @@ const allowedOrigins = [
 app.use(
   cors({
     origin(origin, callback) {
-      // Server-to-server বা curl/Postman (no origin) চাইলে allow করা যায়, নতুবা strict চেক
+      // Allow requests with no origin (e.g., curl, Postman, server-to-server) or from allowed origins
       if (!origin || allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
@@ -54,7 +54,7 @@ app.use(
   })
 );
 
-// Body size limit (বড় payload দিয়ে সার্ভার ক্র্যাশ/DoS ঠেকাতে)
+// Limit JSON payload size to prevent DoS with large bodies
 app.use(express.json({ limit: '100kb' }));
 
 // 4. Firebase Admin Initialization
@@ -64,7 +64,8 @@ try {
     const decoded = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, 'base64').toString('utf8');
     serviceAccount = JSON.parse(decoded);
   } else {
-    serviceAccount = require('./serviceAccountKey.json');
+    // Matches the file name in your project root: firebase-adminsdk.json
+    serviceAccount = require('./firebase-adminsdk.json');
   }
 } catch (err) {
   console.error('Failed to load Firebase service account:', err.message);
@@ -77,7 +78,7 @@ initializeApp({
 
 const auth = getAuth();
 
-// 5. MongoDB Client (একবার তৈরি করে রিকোয়েস্টগুলোতে পুনর্ব্যবহার করা)
+// 5. MongoDB Client (Initialized once and reused across requests)
 const uri = process.env.MONGODB_URI;
 if (!uri) {
   console.error('Missing MONGODB_URI in environment variables');
@@ -90,7 +91,7 @@ const client = new MongoClient(uri, {
     strict: true,
     deprecationErrors: true,
   },
-  maxPoolSize: 20, // কানেকশন পুল অপ্টিমাইজেশন
+  maxPoolSize: 20,
   minPoolSize: 2,
 });
 
@@ -106,7 +107,7 @@ async function getCollections() {
         const downloadsCollection = db.collection('downloads');
         const cartCollection = db.collection('carts');
 
-        // সার্চ বা সর্টিং দ্রুত করতে ইনডেক্স (ব্যর্থ হলে সার্ভার থামাবে না)
+        // Create index for faster sorting without crashing if it fails
         await modelsCollection.createIndex({ createdAt: -1 }).catch(() => {});
         return { modelsCollection, downloadsCollection, cartCollection };
       })
@@ -118,7 +119,7 @@ async function getCollections() {
   return dbPromise;
 }
 
-// Helper: ইনপুট স্যানিটাইজেশন ও টাইপ চেক (NoSQL Injection & XSS প্রতিরোধ)
+// Helper: Sanitize string inputs to reduce XSS and injection risks
 function sanitizeString(value, maxLen = 500) {
   if (typeof value !== 'string') return '';
   return value
@@ -141,7 +142,12 @@ function buildModelPayload(body = {}) {
       payload.image = cleanUrl;
     }
   }
-  if (body.price !== undefined && typeof body.price === 'number' && Number.isFinite(body.price) && body.price >= 0) {
+  if (
+    body.price !== undefined &&
+    typeof body.price === 'number' &&
+    Number.isFinite(body.price) &&
+    body.price >= 0
+  ) {
     payload.price = body.price;
   }
 
@@ -183,7 +189,7 @@ app.get('/', (req, res) => {
 });
 
 // 8. Models Routes
-// GET all models (pagination + lean projection দিয়ে দ্রুত রেসপন্স)
+// GET all models (supports pagination and excludes heavy description field)
 app.get('/models', async (req, res) => {
   try {
     const { modelsCollection } = await getCollections();
@@ -227,7 +233,7 @@ app.post('/models', verifyToken, async (req, res) => {
   }
 });
 
-// GET single model by id
+// GET single model by ID
 app.get('/models/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -246,7 +252,7 @@ app.get('/models/:id', async (req, res) => {
   }
 });
 
-// UPDATE model by id (protected + sanitized)
+// UPDATE model by ID (protected + sanitized)
 app.put('/models/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
@@ -272,7 +278,7 @@ app.put('/models/:id', verifyToken, async (req, res) => {
   }
 });
 
-// DELETE model by id (protected)
+// DELETE model by ID (protected)
 app.delete('/models/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
@@ -300,7 +306,10 @@ app.use((err, req, res, next) => {
   res.status(500).send({ success: false, message: 'Internal server error' });
 });
 
-app.listen(port, () => {
-  console.log(`Server is running on port ${port}`);
-});
+if (!process.env.VERCEL) {
+  app.listen(port, () => {
+    console.log(`Server is running on port ${port}`);
+  });
+}
+
 module.exports = app;
