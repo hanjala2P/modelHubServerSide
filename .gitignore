@@ -5,3 +5,6 @@ serviceAccountKey.json
 .env
 serviceAccountKey.json
 git reset HEAD serviceAccountKey.json
+firebase-adminsdk
+firebase-adminsdk.jsonfirebase-adminsdk.json
+firebase-adminsdk.json
